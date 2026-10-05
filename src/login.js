@@ -2,6 +2,50 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+export async function login(page, credentials, options = {}) {
+    const { alreadyOnLoginPage = false } = options;
+
+    console.log("\nStarting login process...");
+
+    if (!alreadyOnLoginPage) {
+        console.log("Waiting for login page to load...");
+        await page.waitForFunction(() => {
+            const username = document.querySelector("#signInName");
+            const password = document.querySelector("#password");
+            return !!username && !!password;
+        }, { timeout: 60_000 });
+    }
+
+    console.log("Filling in credentials...");
+
+    // Fill username
+    await page.locator("#signInName").fill(credentials.username);
+    console.log("Username filled.");
+
+    // Fill password
+    await page.locator("#password").fill(credentials.password);
+    console.log("Password filled.");
+
+    // Click sign in button
+    await page.locator("#continue").click();
+    console.log("Login form submitted.");
+
+    // waitForFunction survives navigations, unlike page.evaluate
+    const hasSecurityQuestions = await page.waitForFunction(
+        () => document.querySelectorAll("p[id*='kbq'][aria-label]").length > 0,
+        { timeout: 20_000 }
+    ).then(() => true, () => false);
+
+    if (hasSecurityQuestions) {
+        console.log("Security questions detected.");
+        await answerSecurityQuestions(page, credentials);
+    } else {
+        console.log("No security questions required.");
+    }
+
+    console.log("Login process completed.");
+}
+
 export async function answerSecurityQuestions(page, credentials) {
 
     console.log("\nWaiting for security questions...");
