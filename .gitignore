@@ -3,3 +3,4 @@ browser-profile/
 creds/
 .env
 *.log
+screenshots/

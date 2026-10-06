@@ -5,20 +5,34 @@ function sleep(ms) {
 export async function openSchedule(page) {
     console.log("Opening appointment scheduling...");
 
-    await page.waitForSelector(
+    const button = await page.waitForSelector(
         "#continue_application",
         {
             visible: true,
             timeout: 60_000
         }
-    );
+    ).catch(() => null);
 
-    await page.click("#continue_application");
+    if (button) {
 
-    await page.waitForNavigation({
-        waitUntil: "domcontentloaded",
-        timeout: 60_000
-    }).catch(() => {});
+        await button.click();
+
+        await page.waitForNavigation({
+            waitUntil: "domcontentloaded",
+            timeout: 60_000
+        }).catch(() => {});
+
+    } else if (!page.url().includes("/ofc-schedule")) {
+
+        console.log(
+            "Continue button not found. Opening schedule page directly."
+        );
+
+        await page.goto(
+            "https://www.usvisascheduling.com/en-US/ofc-schedule/",
+            { waitUntil: "domcontentloaded" }
+        );
+    }
 
     console.log(
         "Current URL:",

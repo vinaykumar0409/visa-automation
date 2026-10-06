@@ -1,9 +1,10 @@
 import puppeteer from "puppeteer";
 import fs from "fs";
 import path from "path";
+import { AsyncLocalStorage } from "async_hooks";
+import { spawn } from "child_process";
 
 import { login } from "./login.js";
-import { installNetworkLogger } from "./network.js";
 
 import {
     openSchedule,
@@ -11,8 +12,85 @@ import {
 } from "./ofc.js";
 
 import {
-    checkPostAvailability
+    checkPostAvailability,
+    bookBestSlot
 } from "./availability.js";
+
+
+const AUTO_SUBMIT = true;
+
+const START_URL =
+    "https://www.ustraveldocs.com/in/en/nonimmigrant-visa";
+
+const CHECK_INTERVAL =
+    60 * 1000;
+
+const BLOCK_BACKOFF =
+    5 * 60 * 1000;
+
+const START_STAGGER =
+    0;
+
+// All accounts begin monitoring together and check on the same ticks
+const GATE_TIMEOUT =
+    3 * 60 * 1000;
+
+let totalAccounts = 0;
+
+const settledAccounts = new Set();
+
+let monitorBase = 0;
+
+let openGate;
+
+const monitoringGate =
+    new Promise(resolve => {
+        openGate = resolve;
+    });
+
+function settleAccount(name) {
+
+    settledAccounts.add(name);
+
+    if (settledAccounts.size >= totalAccounts) {
+        openGate();
+    }
+}
+
+
+// ------------------------------------------------------
+// Prefix every log line with the account that produced it
+// ------------------------------------------------------
+
+const accountContext =
+    new AsyncLocalStorage();
+
+for (const method of ["log", "error"]) {
+
+    const original =
+        console[method].bind(console);
+
+    console[method] = (...args) => {
+
+        const name =
+            accountContext.getStore();
+
+        if (!name) {
+            return original(...args);
+        }
+
+        if (typeof args[0] === "string") {
+            args[0] =
+                args[0].replace(
+                    /^(\n*)/,
+                    `$1[${name}] `
+                );
+            return original(...args);
+        }
+
+        return original(`[${name}]`, ...args);
+    };
+}
 
 
 function sleep(ms) {
@@ -22,48 +100,54 @@ function sleep(ms) {
 }
 
 
-function loadCredentials() {
+function loadAccounts() {
 
-    const filePath = path.resolve(
-        "creds",
-        "account1.json"
-    );
+    const dir = path.resolve("creds");
 
-    if (!fs.existsSync(filePath)) {
+    if (!fs.existsSync(dir)) {
         throw new Error(
-            `Credentials file not found: ${filePath}`
+            `Credentials folder not found: ${dir}`
         );
     }
 
-    return JSON.parse(
-        fs.readFileSync(filePath, "utf8")
-    );
-}
+    const accounts =
+        fs.readdirSync(dir)
+            .filter(file =>
+                /^account.*\.json$/i.test(file)
+            )
+            .sort()
+            .map(file => {
 
+                const credentials =
+                    JSON.parse(
+                        fs.readFileSync(
+                            path.join(dir, file),
+                            "utf8"
+                        )
+                    );
 
-async function getPage(browser) {
+                if (
+                    !credentials.username ||
+                    !credentials.password
+                ) {
+                    throw new Error(
+                        `${file}: username/password missing`
+                    );
+                }
 
-    const pages = await browser.pages();
+                return {
+                    name: path.basename(file, ".json"),
+                    credentials
+                };
+            });
 
-    console.log(
-        `Connected to Chrome. Open pages: ${pages.length}`
-    );
-
-    // Prefer USTravelDocs/usvisascheduling page
-    for (const page of pages) {
-
-        const url = page.url();
-
-        if (
-            url.includes("ustraveldocs.com") ||
-            url.includes("usvisascheduling.com")
-        ) {
-            return page;
-        }
+    if (!accounts.length) {
+        throw new Error(
+            `No account*.json files found in ${dir}`
+        );
     }
 
-    return pages[0] ||
-        await browser.newPage();
+    return accounts;
 }
 
 
@@ -95,7 +179,15 @@ async function waitForAzureLogin(page) {
                         !!username &&
                         !!password
                 };
-            });
+            }).catch(() => null);
+
+
+        if (!state) {
+
+            await sleep(1000);
+
+            continue;
+        }
 
 
         if (state.loginForm) {
@@ -110,15 +202,37 @@ async function waitForAzureLogin(page) {
 
         console.log(
             "Waiting...",
-            state.url
+            state.url.slice(0, 100)
         );
 
-        await sleep(2000);
+        await sleep(1000);
+    }
+}
+
+
+function playAlertSound(times = 6) {
+
+    try {
+
+        spawn(
+            "powershell",
+            [
+                "-NoProfile",
+                "-Command",
+                `1..${times} | ForEach-Object { [console]::beep(1400, 350); Start-Sleep -Milliseconds 150 }`
+            ],
+            { stdio: "ignore", windowsHide: true }
+        ).on("error", () => {});
+
+    } catch {
+        // Sound is best-effort
     }
 }
 
 
 async function notifyUser(result) {
+
+    playAlertSound();
 
     console.log("");
     console.log(
@@ -165,25 +279,343 @@ async function notifyUser(result) {
 }
 
 
+async function isAccessLimited(page) {
+
+    const text = await page.evaluate(() =>
+        document.body?.innerText || ""
+    ).catch(() => "");
+
+    return /access limitation|prohibited conduct/i.test(text);
+}
+
+
+async function logoutAndClose(page, context) {
+
+    console.log("Logging out of this account and closing its tab...");
+
+    try {
+
+        const link = await page.$(
+            "a[href*='LogOff' i], a[href*='signout' i], a[href*='logout' i]"
+        );
+
+        if (link) {
+
+            await link.click();
+
+        } else {
+
+            await page.goto(
+                "https://www.usvisascheduling.com/Account/Login/LogOff",
+                { waitUntil: "domcontentloaded", timeout: 20_000 }
+            );
+        }
+
+        await sleep(3000);
+
+    } catch (error) {
+
+        console.log("Logout page did not respond:", error.message);
+    }
+
+    // Closing the isolated context also discards this account's session cookies
+    await context.close().catch(() => {});
+}
+
+
+async function runAccount(browser, { name, credentials }, state) {
+
+    console.log("Starting...");
+
+    // Isolated cookies/session per account
+    const context =
+        await browser.createBrowserContext();
+
+    state.context = context;
+
+    const page =
+        await context.newPage();
+
+    page.setDefaultTimeout(
+        60_000
+    );
+
+    await page.goto(
+        START_URL,
+        { waitUntil: "domcontentloaded" }
+    );
+
+    console.log(
+        "Opened:",
+        page.url()
+    );
+
+
+    await page.locator(
+        "div.usa-dialog__header button"
+    ).click({
+        timeout: 3000
+    }).catch(() => {
+        console.log("No popup to close.");
+    });
+
+
+    const loginButton =
+        await page.$(
+            "#acs-login > span"
+        );
+
+    if (loginButton) {
+
+        console.log(
+            "Clicking Visa Login..."
+        );
+
+        await loginButton.click();
+    }
+
+
+    // Wait for Cloudflare / the login form
+    await waitForAzureLogin(page);
+
+    await login(
+        page,
+        credentials,
+        {
+            alreadyOnLoginPage: true
+        }
+    );
+
+    await openSchedule(page);
+
+    const posts =
+        await getOFCPosts(page);
+
+    if (!posts.length) {
+
+        throw new Error(
+            "No OFC posts found."
+        );
+    }
+
+    console.log("");
+    console.log(
+        `Found ${posts.length} OFC post(s).`
+    );
+
+    state.monitoring = true;
+
+    settleAccount(name);
+
+    console.log(
+        "Ready. Waiting for the other account(s) so monitoring starts together..."
+    );
+
+    await Promise.race([
+        monitoringGate,
+        sleep(GATE_TIMEOUT)
+    ]);
+
+    if (!monitorBase) {
+        monitorBase = Date.now();
+    }
+
+    // Slots that already failed ("no longer available") are never retried
+    const failedSlots = new Set();
+
+
+    while (true) {
+
+        console.log("");
+        console.log(
+            "======================================="
+        );
+
+        console.log(
+            "Checking appointment availability"
+        );
+
+        console.log(
+            new Date().toLocaleString()
+        );
+
+        console.log(
+            "======================================="
+        );
+
+
+        let blocked = false;
+
+        if (await isAccessLimited(page)) {
+
+            playAlertSound(3);
+
+            console.log(
+                "⚠ Access limitation page detected. Stopping this account."
+            );
+
+            await logoutAndClose(page, context);
+
+            return;
+        }
+
+        for (const post of posts) {
+
+            try {
+
+                let result =
+                    await checkPostAvailability(
+                        page,
+                        post
+                    );
+
+                for (let round = 1; result.available; round++) {
+
+                    await notifyUser(
+                        result
+                    );
+
+                    await page.bringToFront().catch(() => {});
+
+                    let booking = null;
+
+                    if (AUTO_SUBMIT) {
+
+                        try {
+
+                            booking = await bookBestSlot(
+                                page,
+                                failedSlots,
+                                post.name
+                            );
+
+                            console.log(
+                                "If a Cloudflare check or confirmation page is shown, finish it manually in this tab."
+                            );
+
+                        } catch (error) {
+
+                            console.error(
+                                "Auto-booking failed, book manually:",
+                                error.message
+                            );
+                        }
+                    }
+
+                    if (
+                        booking &&
+                        ["gone", "gaveup"].includes(booking.outcome)
+                    ) {
+
+                        if (round >= 5) {
+
+                            console.log(
+                                `Not booked at ${post.name}. Moving on to the next location.`
+                            );
+
+                            break;
+                        }
+
+                        console.log(
+                            `Slot not booked (${booking.outcome}). Re-checking ${post.name} for other dates/times...`
+                        );
+
+                        result =
+                            await checkPostAvailability(
+                                page,
+                                post
+                            );
+
+                        continue;
+                    }
+
+                    await page.bringToFront().catch(() => {});
+
+                    playAlertSound(10);
+
+                    console.log(
+                        "Tab will remain open."
+                    );
+
+                    return;
+                }
+
+            } catch (error) {
+
+                console.error(
+                    `Error checking ${post.name}:`,
+                    error.message
+                );
+
+                if (await isAccessLimited(page)) {
+
+                    playAlertSound(3);
+
+                    console.log(
+                        "⚠ Access limitation page detected. Stopping this account."
+                    );
+
+                    await logoutAndClose(page, context);
+
+                    return;
+                }
+
+                if (/\b403\b/.test(error.message)) {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+
+
+        console.log(
+            "No appointment detected."
+        );
+
+        if (blocked) {
+
+            console.log(
+                `Site returned 403. Backing off for ${BLOCK_BACKOFF / 60000} minutes.`
+            );
+
+            await sleep(BLOCK_BACKOFF);
+        }
+
+        // Next tick on the schedule shared by all accounts
+        const now = Date.now();
+
+        const next =
+            monitorBase +
+            (Math.floor((now - monitorBase) / CHECK_INTERVAL) + 1) *
+            CHECK_INTERVAL;
+
+        console.log(
+            `Next check at ${new Date(next).toLocaleTimeString()} (in ${Math.round((next - now) / 1000)}s)...`
+        );
+
+        await sleep(
+            next - now
+        );
+    }
+}
+
+
 async function main() {
 
     console.log(
         "Starting visa automation..."
     );
 
+    const accounts =
+        loadAccounts();
 
-    const credentials =
-        loadCredentials();
-
-
-    // --------------------------------------------------
-    // CONNECT TO EXISTING CHROME
-    // --------------------------------------------------
+    console.log(
+        `Accounts: ${accounts.map(a => a.name).join(", ")}`
+    );
 
     console.log(
         "Connecting to Chrome on port 9222..."
     );
-
 
     let browser;
 
@@ -192,7 +624,9 @@ async function main() {
         browser =
             await puppeteer.connect({
                 browserURL:
-                    "http://127.0.0.1:9222"
+                    "http://127.0.0.1:9222",
+                defaultViewport:
+                    null
             });
 
     } catch (error) {
@@ -218,227 +652,75 @@ async function main() {
         throw error;
     }
 
-
     console.log(
         "✅ Connected to Chrome."
     );
 
 
-    const page =
-        await getPage(browser);
+    totalAccounts = accounts.length;
 
+    const runs = accounts.map((account, index) =>
+        accountContext.run(account.name, async () => {
 
-    page.setDefaultTimeout(
-        60_000
-    );
+            await sleep(index * START_STAGGER);
 
+            const MAX_ATTEMPTS = 3;
 
-    console.log(
-        "Current page:",
-        page.url()
-    );
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 
-
-    installNetworkLogger(page);
-
-
-    try {
-
-        // --------------------------------------------------
-        // If we're still on USTravelDocs, click Visa Login
-        // --------------------------------------------------
-
-        if (
-            page.url().includes(
-                "ustraveldocs.com"
-            )
-        ) {
-
-            console.log(
-                "Checking USTravelDocs..."
-            );
-
-
-            try {
-
-                await page.locator(
-                    "div.usa-dialog__header button"
-                ).click({
-                    timeout: 3000
-                });
-
-                console.log(
-                    "Popup closed."
-                );
-
-            } catch {
-
-                console.log(
-                    "No popup to close."
-                );
-            }
-
-
-            const loginButton =
-                await page.$(
-                    "#acs-login > span"
-                );
-
-
-            if (loginButton) {
-
-                console.log(
-                    "Clicking Visa Login..."
-                );
-
-
-                await loginButton.click();
-
-
-                console.log(
-                    "Visa Login clicked."
-                );
-            }
-        }
-
-
-        // --------------------------------------------------
-        // Wait for Cloudflare to finish
-        // --------------------------------------------------
-
-        await waitForAzureLogin(page);
-
-
-        // --------------------------------------------------
-        // AUTOMATED LOGIN
-        // --------------------------------------------------
-
-        await login(
-            page,
-            credentials,
-            {
-                alreadyOnLoginPage: true
-            }
-        );
-
-
-        // --------------------------------------------------
-        // APPOINTMENT PAGE
-        // --------------------------------------------------
-
-        await openSchedule(page);
-
-
-        // --------------------------------------------------
-        // OFC POSTS
-        // --------------------------------------------------
-
-        const posts =
-            await getOFCPosts(page);
-
-
-        if (!posts.length) {
-
-            throw new Error(
-                "No OFC posts found."
-            );
-        }
-
-
-        console.log("");
-        console.log(
-            `Found ${posts.length} OFC post(s).`
-        );
-
-
-        // --------------------------------------------------
-        // MONITOR
-        // --------------------------------------------------
-
-        const CHECK_INTERVAL =
-            5 * 60 * 1000;
-
-
-        while (true) {
-
-            console.log("");
-            console.log(
-                "======================================="
-            );
-
-            console.log(
-                "Checking appointment availability"
-            );
-
-            console.log(
-                new Date().toLocaleString()
-            );
-
-            console.log(
-                "=======================================");
-
-
-            for (const post of posts) {
+                const state = {
+                    context: null,
+                    monitoring: false
+                };
 
                 try {
 
-                    const result =
-                        await checkPostAvailability(
-                            page,
-                            post
-                        );
+                    await runAccount(
+                        browser,
+                        account,
+                        state
+                    );
 
+                    return;
 
-                    if (result.available) {
+                } catch (error) {
 
-                        await notifyUser(
-                            result
-                        );
+                    console.error(
+                        `\n❌ ERROR (attempt ${attempt}/${MAX_ATTEMPTS}):`,
+                        error.message
+                    );
+
+                    // Only retry failures during setup, not once monitoring has started
+                    if (state.monitoring || attempt === MAX_ATTEMPTS) {
+
+                        settleAccount(account.name);
 
                         console.log(
-                            "Browser will remain open."
+                            "Tab remains open."
                         );
 
                         return;
                     }
 
-                } catch (error) {
+                    await state.context?.close().catch(() => {});
 
-                    console.error(
-                        `Error checking ${post.name}:`,
-                        error.message
+                    console.log(
+                        "Retrying in 30 seconds..."
                     );
+
+                    await sleep(30_000);
                 }
             }
+        })
+    );
 
+    await Promise.all(runs);
 
-            console.log(
-                "No appointment detected."
-            );
+    console.log(
+        "\nAll accounts finished. Browser stays open; press Ctrl+C to exit."
+    );
 
-
-            console.log(
-                "Waiting 5 minutes..."
-            );
-
-
-            await sleep(
-                CHECK_INTERVAL
-            );
-        }
-
-
-    } catch (error) {
-
-        console.error(
-            "\n❌ ERROR:",
-            error
-        );
-
-        console.log(
-            "\nBrowser remains open."
-        );
-    }
+    await new Promise(() => {});
 }
 
 
