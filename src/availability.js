@@ -99,23 +99,30 @@ export async function inspectAvailability(page) {
             bodyLower.includes(word)
         );
 
-    const dateCandidates =
-        result.candidates.filter(item => {
-            if (item.disabled) {
-                return false;
-            }
+    // Enabled days in the jQuery UI datepicker are <a> links;
+    // unavailable days are plain cells without a link.
+    const dateCandidates = await page.$$eval(
+        "#datepicker td a",
+        links =>
+            links.map(link => {
+                const cell = link.closest("td");
+                const month = Number(cell?.getAttribute("data-month"));
+                const year = cell?.getAttribute("data-year");
+                const day = link.textContent.trim();
 
-            if (item.dataDate) {
-                return true;
-            }
-
-            // Date-looking text such as 1, 2, 15, 28
-            return /^\d{1,2}$/.test(item.text);
-        });
+                return {
+                    text: day,
+                    dataDate:
+                        year && !Number.isNaN(month)
+                            ? `${month + 1}/${day}/${year}`
+                            : ""
+                };
+            })
+    );
 
     return {
         available:
-            positiveText && dateCandidates.length > 0,
+            dateCandidates.length > 0,
 
         positiveText,
 
